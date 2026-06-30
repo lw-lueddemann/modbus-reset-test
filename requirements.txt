@@ -1,0 +1,4 @@
+# pymodbus 3.11+ removed the classic ModbusSlaveContext API this script uses,
+# so pin to the 3.5–3.9 range. Verified on 3.6.9.
+pymodbus>=3.5,<3.10
+pyserial
