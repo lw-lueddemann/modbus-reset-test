@@ -20,6 +20,9 @@ classic ModbusSlaveContext API used here, so stay on the pinned range.
 """
 
 import threading
+from datetime import datetime
+
+from serial.tools import list_ports
 
 from pymodbus.datastore import (
     ModbusSequentialDataBlock,
@@ -68,26 +71,64 @@ class Oscillator:
 
 
 # --------------------------------------------------------------------------- #
+# Data block that logs master access
+# --------------------------------------------------------------------------- #
+class LoggingDataBlock(ModbusSequentialDataBlock):
+    """Holding-register block that prints every master read/write.
+
+    The script's own 5-second refresh writes go through `internal_update()`,
+    which sets a flag so those writes are NOT logged as master traffic --
+    the log then shows only what an external master actually does.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._internal = False
+
+    @staticmethod
+    def _log(action, address, detail):
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{ts}] MASTER {action} addr={address} {detail}", flush=True)
+
+    def getValues(self, address, count=1):
+        values = super().getValues(address, count)
+        self._log("READ ", address, f"count={count} -> {values}")
+        return values
+
+    def setValues(self, address, values):
+        if not self._internal:
+            self._log("WRITE", address, f"values={values}")
+        super().setValues(address, values)
+
+    def internal_update(self, address, values):
+        """Write performed by the script itself -- not logged as master access."""
+        self._internal = True
+        try:
+            self.setValues(address, values)
+        finally:
+            self._internal = False
+
+
+# --------------------------------------------------------------------------- #
 # Context + background updater (transport-independent, so it is unit-testable)
 # --------------------------------------------------------------------------- #
 def build_context(starts, unit_id):
-    """Return (ModbusServerContext, oscillators) seeded with the start values."""
+    """Return (ModbusServerContext, oscillators, block) seeded with start values."""
     oscillators = [Oscillator(s) for s in starts]
-    block = ModbusSequentialDataBlock(0, [osc.value for osc in oscillators])
+    block = LoggingDataBlock(0, [osc.value for osc in oscillators])
     slave = ModbusSlaveContext(hr=block, zero_mode=True)
     context = ModbusServerContext(slaves={unit_id: slave}, single=False)
-    return context, oscillators
+    return context, oscillators, block
 
 
-def updater(context, unit_id, oscillators, stop_event, interval=INTERVAL):
+def updater(context, unit_id, oscillators, stop_event, block, interval=INTERVAL):
     """Every `interval` s, push current values then advance the oscillators.
 
     Overwriting the datastore each tick is what makes master writes 'ignored'.
     """
-    slave = context[unit_id]
     while not stop_event.is_set():
         values = [osc.value for osc in oscillators]
-        slave.setValues(HOLDING_FC, 0, values)
+        block.internal_update(0, values)
         print("registers:", values, flush=True)
 
         stop_event.wait(interval)
@@ -116,12 +157,40 @@ def _ask(prompt, default, cast, valid=None):
         return value
 
 
+def _ask_port():
+    """List available serial ports and let the user pick one (or type a name)."""
+    ports = sorted(list_ports.comports(), key=lambda p: p.device)
+    if not ports:
+        print("No serial ports detected. Enter one manually (e.g. COM3).")
+        return _ask("Serial port", "COM1", str)
+
+    print("Available serial ports:")
+    for i, p in enumerate(ports):
+        desc = p.description or "n/a"
+        print(f"  [{i}] {p.device}  -  {desc}")
+
+    while True:
+        raw = input(
+            f"Select port by number [0-{len(ports) - 1}], "
+            f"or type a port name [{ports[0].device}]: "
+        ).strip()
+        if raw == "":
+            return ports[0].device
+        if raw.isdigit():
+            idx = int(raw)
+            if 0 <= idx < len(ports):
+                return ports[idx].device
+            print(f"  ! number out of range (0-{len(ports) - 1})")
+            continue
+        return raw  # treat anything non-numeric as an explicit port name
+
+
 def ask_settings():
     print("=== Modbus RTU slave configuration ===")
     cfg = {
-        "port": _ask("Serial port", "/dev/ttyUSB0", str),
+        "port": _ask_port(),
         "baudrate": _ask("Baudrate", 9600, int),
-        "parity": _ask("Parity (N/E/O)", "N", lambda s: s.upper(), valid={"N", "E", "O"}),
+        "parity": _ask("Parity (N/E/O)", "E", lambda s: s.upper(), valid={"N", "E", "O"}),
         "bytesize": _ask("Data bits (7/8)", 8, int, valid={7, 8}),
         "stopbits": _ask("Stop bits (1/2)", 1, int, valid={1, 2}),
         "unit_id": _ask("Slave / unit id", 1, int),
@@ -138,12 +207,12 @@ def ask_settings():
 # --------------------------------------------------------------------------- #
 def main():
     cfg = ask_settings()
-    context, oscillators = build_context(cfg["starts"], cfg["unit_id"])
+    context, oscillators, block = build_context(cfg["starts"], cfg["unit_id"])
 
     stop_event = threading.Event()
     t = threading.Thread(
         target=updater,
-        args=(context, cfg["unit_id"], oscillators, stop_event),
+        args=(context, cfg["unit_id"], oscillators, stop_event, block),
         daemon=True,
     )
     t.start()
